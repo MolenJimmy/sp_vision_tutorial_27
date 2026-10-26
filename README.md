@@ -1,144 +1,197 @@
-# 27算法组导航方向招新大作业
+# 算法组导航方向大作业&#x20;
 
-## 0\. 环境配置
+## 1. 项目概览
 
-```Plain Text
-// 已装 Ubuntu 22.04 和 ROS2 Humble
-sudo apt update
-sudo apt install -y \
-  python3-colcon-common-extensions \
-  python3-rosdep \
-  ros-humble-pluginlib \
-  ros-humble-tf2-ros \
-  ros-humble-tf2-geometry-msgs \
-  ros-humble-nav-msgs \
-  ros-humble-std-srvs \
-  ros-humble-rviz2 \
-  ros-humble-behaviortree-cpp-v3 \
-  qtbase5-dev \
-  libopencv-dev \
-  libyaml-cpp-dev
-  
-pip3 install --user pygame numpy Pillow
+本工程是一个 ROS2 Humble 下的"一次点击导航"系统：行为树下发目标 → A\* 规划全局路径 → 自研控制器插件跟踪路径 → 全向底盘仿真器执行。
+
+在发放代码基础上完成了三部分工作：
+
+| 部分  | 内容                                                | 涉及文件                                                    |
+| --- | ------------------------------------------------- | ------------------------------------------------------- |
+| 必做① | 补全全系统参数，接通所有话题/插件链路                               | `sp_nav_bringup/config/nav_params.yaml`                 |
+| 必做② | 实现路径跟踪控制器插件（PD + 预瞄 + 终点减速 + 加速度限幅）               | `sp_controller_server/plugins/pid_controller.{hpp,cpp}` |
+| 必做③ | RViz 可视化（代价地图 / 全局路径 / 机器人位姿 / 目标点）、git 管理        | `sp_nav_bringup/rviz/rviz.rviz`、仓库 commit 记录            |
+| 加分项 | A\* 轨迹平滑：视线剪枝（shortcut）+ 切角圆化（Chaikin），并做了几何级安全校验 | `sp_global_planner/plugins/astar_planner.{hpp,cpp}`     |
+
+## 2. 系统架构与数据流
+
+```
+sp_decision (决策BT 10Hz)
+    │ action: navigate_to_pose
+    ▼
+nav_interface_node (导航BT)
+    │ TF 查位姿 ──► /make_plan 服务 ──► planner_server (A*)
+    │                                     ▲ 融合 /global_costmap + /local_costmap
+    │ /set_control_enable(true)
+    ▼
+controller_server (50Hz 控制环)
+    │ 路径 + 位姿 + 速度 ──► PidController 插件
+    ▼ /sentry/cmd_vel (Twist, base_link 系)
+sp_nav_sim (运动学积分 → odom/TF) ──► 闭环
 ```
 
-## 1\. 作业目标
+三条"总线"：TF（位姿）、OccupancyGrid 话题（地图）、`/sentry/cmd_vel`（指令）。两层行为树之间通过 `NavigateToPose` action 通信，规划器与控制器之间通过 `/global_path` 话题衔接。
 
-在给定的迷宫地图上，完成 **一次点击导航** 全流程：
+## 3. 必做工作 ①：参数补全（nav\_params.yaml）
 
-1. 机器人从 **固定起点** 出发；
+发放的 yaml 大部分字段为空，工程无法启动（各节点 `require_param` 读不到参数会直接抛异常）。
 
-2. 选手在 RViz 中对 **指定终点** 发布一次目标；
+### 3.1 话题名&#x20;
 
-3. 上层行为树 `click_nav.xml` 触发导航；
+仿真器与 esdf 发布器的话题名在源码中写死、且不允许修改仿真器，只能让 yaml 迁就：
 
-4. 下层行为树 `default_nav_with_fallback.xml` 调用 A\* 规划全局路径；
+| 参数                                   | 值                        | 依据        |
+| ------------------------------------ | ------------------------ | --------- |
+| `controller_server.odom_topic`       | `/Odometry`              | 仿真器固定发布   |
+| `controller_server.odom_frame_id`    | `lidar_odom`             | 仿真器 TF 命名 |
+| `controller_server.cmd_vel_topic`    | `/sentry/cmd_vel`        | 仿真器固定订阅   |
+| `planner_server.local_costmap_topic` | `/local_costmap/costmap` | 仿真器固定发布   |
 
-5. **你实现的控制器插件** 跟踪规划轨迹，使机器人准确、平滑地到达终点。
+### 3.2 costmap 选择
 
-## 2\. 任务场景
+最初给 `planner_server.costmap_topic` 填了 `/esdf_costmap`，结果**路径穿墙**。排查源码后发现三个话题的编码完全不同：
 
-### 2\.1 地图
+- `/esdf_costmap` 的格子值 = **到障碍的距离 × 100**：墙 ≈ 0，开阔地 ≈ 127 —— 数值语义与 A\* 的"≥ lethal\_cost 视为墙"**正好相反**，导致"墙可走、开阔地是墙"，A\* 专门挑贴墙的路走
 
-|项目|数值|
-|---|---|
-|文件|`maze_map.pgm` / `maze_map.yaml`|
-|分辨率|`0.05 m/pixel`|
-|尺寸|`15.00 m × 15.00 m`（300×300）|
-|走廊宽度|约 `1.50 m`|
-|墙厚|约 `0.15 m`<br>|
+- `/global_costmap` 的格子值才是"危险程度"：`robot_radius+margin` 内 = 100（墙），0.30~~0.70m 为 1~~99 惩罚，之外为 0
 
-<p align="center">
-  <img src="images/image_1.png" alt="仿真 GUI" width="420" />
-  <img src="images/image_2.png" alt="代价地图与全局路径" width="420" />
-</p>
+**修复**：`costmap_topic: "/global_costmap"`，与 `lethal_cost: 100` 咬合。
 
-### 2\.2 固定起终点
+### 3.3 插件注册名
 
-||**map 系坐标 \(x, y\)**|**说明**|
-|---|---|---|
-|**起点**|`(0.900, 0.900)`|迷宫左下角通路中心；仿真初始位置已设为此处|
-|**终点**|`(14.100, 14.100)`|迷宫右上角通路中心；评测时只允许对该点 click 一次|
+`plugin_type` 填 plugin\_description.xml 中的 `name` 字段（查找名）：
 
-- **不允许拖拽改起点、不允许中途二次改目标；**
+- 规划器：`sp_global_planner/AStarPlanner`
 
-- **不允许手动发布 ****`cmd_vel`**** 绕过控制器。**
+- 控制器：`PidController`
 
-### 2\.3 仿真器
+且 `plugin_name`与参数块名必须一致：`plugin_name: "AStar"` ↔ `AStar:` 块；`PidController:` 同理。
 
-- **不允许修改仿真器内部代码及参数；**
+### 3.4 控制器参数
 
-- **仿真里机器人撞墙便会卡住。**
+```yaml
+PidController:
+  base_frame_id: "base_link"
+  kp_v: 1.5            # 速度比例增益
+  v_max: 2.0           # 与仿真器 v_max 对齐
+  lookahead_distance: 0.5
+  arrive_tol: 0.05     # 比 BT 判到的 0.3 更严，保证判定到达时位置准确
+  kd_v: 0.8            # 横向阻尼
+  decel_dist: 1.0      # 终点减速区
+  a_max: 2.0           # 与仿真器 a_max 对齐
+```
 
-## 3\. 发放内容与你需要完成的部分
+## 4. 必做工作 ②：控制器插件（PidController）
 
-### 3\.1 发放给你的代码
+### 4.1 总体思路
 
-|包|内容|
-|---|---|
-|`robot_msg`|消息 / Action|
-|`sp_map_server`|ESDF / 全局代价地图|
-|`sp_global_planner`|A\* 全局规划|
-|`sp_nav_bt`|下层 BT：`default_nav_with_fallback.xml`|
-|`sp_decision`|上层 BT：`click_nav.xml`|
-|`sp_nav_bringup`|启动与地图（含 `maze_map`）|
-|`sp_nav_sim`|拖拽仿真（里程计 \+ TF）|
-|`sp_controller_server`|控制器框架（`ControllerPlugin` 接口、`controller_node`、pluginlib 加载）|
+在 `computeVelocityCommands(pose, velocity)` 中按五步流计算 50Hz 速度指令：
 
-控制器侧（名称可自定，但须 pluginlib 可加载）：
+```
+找最近点 → 沿路径取预瞄点 → 转车体系 → PD 控制 → 三级限幅（v_max → 终点减速 → 加速度限幅）
+```
 
-- `include/sp_controller_server/controller_plugin.hpp`（接口，只读）
+### 4.2 各步说明
 
-- `plugins/<你的控制器>.hpp/.cpp`（由你实现）
+**① 最近点搜索**：遍历路径求距车最近的点下标，确定在路径上的进度。
 
-- `plugin_description.xml`、`CMakeLists.txt`（需正确注册插件）
+**② 预瞄点**：从最近点沿路径累计弧长，进一步考虑车速越快预瞄距离越远，前进 `lookahead_distance + 0.5 * last_speed_` 处作为临时目标。直接追最近点会让车贴着已走过的路径慢慢蹭，预瞄让车"看向远方"，转弯提前转向、直线不易画龙。接近终点时弧长不足，目标自动落在终点。
 
-- `launch/controller.launch.py`
+**③ 转车体系**：从位姿四元数提取偏航角
 
-**注意：代码中已给出 PidController（\.cpp 与 \.hpp）的大体框架，可直接在此基础上修改。**
+```
+yaw = atan2(2(wz+xy), 1−2(y²+z²))
+```
 
-### 3\.2 你必须完成的工作（代码中已用 TODO 标明）
+将 map 系偏差向量按 yaw 旋转，得到偏差在车体系分量：
 
-1. **实现路径跟踪控制器插件**
+```
+ex =  cos(yaw)·mx + sin(yaw)·my    （车头方向）
+ey = −sin(yaw)·mx + cos(yaw)·my    （车体左侧）
+```
 
-实现 `ControllerPlugin` 三个接口：
+**④ PD 控制**（横向加阻尼）：
 
-- `configure(...)`：读参数、初始化
+```
+vx = kp_v · ex
+vy = kp_v · ey + kd_v · (ey − last_ey)
+```
 
-- `setPlan(path)`：接收 `/global_path`（经 controller server 转发）
+**⑤ 三级限幅**（依次收紧）：
 
-- `computeVelocityCommands(pose, velocity)`：输出 `TwistStamped`（线速度）
+1. 速度上限 `v_max`（2.0，与仿真器一致）
+2. **终点减速段**：距真终点 < `decel_dist` 时，允许速度线性收缩到 `v_max·dist/decel_dist`（保底 0.1 m/s）——保证准确到达
+3. **加速度限幅**：每拍速度变化 ≤ `a_max × dt`，输出平滑无阶跃
 
-2. **修改参数使工程能在迷宫上跑通**
+\*\*       到达判断**用真终点距离 <** **`arrive_tol`** **时输出零速并**清零全部状态\*\*。
 
-发放包中部分路径 / 话题 / 坐标系 / 为空，直接运行`sim_nav_all_start.sh`不能正确评测迷宫任务，你需要自行排查并修改。
+### 4.3 状态管理（容易出错的细节）
 
-3. **可视化与代码管理**
+PD 与限幅都依赖跨拍记忆，两个时机必须清零，否则旧目标的记忆会污染新导航：
 
-在 RViz 中至少清晰展示：全局代价地图、全局路径、机器人位姿、目标点等；代码要有清晰的 commit 记录，知道该忽略哪些文件。
+- 判定到达返回零速时：同样清零
 
-## 4\. 评分标准（100 分）
+- `setPlan()` 收到新路径不应该清零，`planner_server`一定时间内会规划新路线，在此处重置会导致车速停留在一个较小的区间，导致运行时间变长
 
-**评测方式：固定起点 → 一次 click 到固定终点 → 记录从目标下发到判定到达的过程。**
+### 4.4 输出坐标系
 
-|**分项**|**分值**|**考察内容**|
-|---|---|---|
-|**准确到达**|25|最终位置与终点距离|
-|**时间**|25|从收到目标到到达的用时|
-|**跟踪精度**|20|对采样位姿计算到全局参考路径的误差|
-|**报告**|15|清晰的 README 介绍你的项目|
-|**可视化与代码管理**|15|RViz 地图、路径、机器人清晰；代码管理清晰|
+`cmd_vel.header.frame_id = "base_link"`：仿真底盘按车体系解释指令（x 车头、y 车左）。
 
-## 5\. 加分项（**不超过总分 100**）
+## 5. 加分项：A\* 轨迹平滑（sp\_global\_planner）
 
-- 轨迹平滑（平滑 A\* 轨迹或直接使用其他算法）；
+A\* 输出是栅格阶梯折线：直线上数百个冗余点、拐角是 90° 直角。平滑分两刀 + 一道安全闸，全部在 `createPlan` 出路径后处理：
 
-- 自研优于 PID 的控制器（例如使用 LQR 或 MPC）。
+### 5.1 视线剪枝（shortcut）
 
-## 6\. 提交要求
+直觉：两点之间直线无遮挡，中间点全是废点。贪心实现——从当前锚点向路径最远端倒序尝试，找到"能直连的最远点"就跳过去：
 
-- 线上提交到自己的 git 仓库对应分支，需包含完整可编译源码；
+```
+501 点锯齿路径 → 4~10 个锚点，直线彻底笔直
+```
 
-- 如虚拟机卡顿且自己无法解决，10\.6后可线下到地下室使用小电脑调试（需提前告知群里导航方向管理员）；
+### 5.2 切角圆化（Chaikin）
 
-- DDL：10\.25。
+对每段相邻点对 (A,B) 生成两个 1/4、3/4 处的新点，端点保留，迭代 2 轮：
+
+```
+P = 0.75·A + 0.25·B,  Q = 0.25·A + 0.75·B
+```
+
+尖角被逐步削成圆弧。选择 Chaikin 而非样条插值的原因：**新点永远落在原线段内，曲线被原折线包住，安全余量不会变小**——不需要额外的碰撞检查就天然安全。
+
+### 5.3 几何级安全校验（lineFree 通道检查）
+
+初版剪枝曾出现"抄近道贴墙"。最终版本采用几何精确判据，而非代价阈值：
+
+- 对线段附近穷举墙格（lethal 格），计算每个墙格中心到线段的**解析距离**（点到线段投影并 clamp 到 \[0,1]）
+
+- 距离 ≤ `reach = res + res·√2/2` 判为不可通行——外扩量覆盖栅格离散化误差（正方形格子按中心判距，角部最多比中心近半个对角线）
+
+- 车半径安全由地图膨胀（`robot_radius + margin`）承担，通道检查只补离散误差，职责单一
+
+- **Chaikin 每轮结果逐线段校验，不通过则回退该轮并告警**——平滑永不破坏安全性
+
+### 5.4 效果
+
+- 路径点数：数百 → 数十
+
+- 直线段笔直小车到达终点的耗时变短
+
+- 转弯可能存在撞墙的情况（根据终点的设置情况不同），可能原因是对路线的裁剪会把一段曲线拉直，导致直线通过小车与墙面的间隔太短而撞墙，还需要充分结合代价地图来优化规划算法才能够投入使用。
+
+## 6. 可视化与代码管理
+
+- RViz 展示：全局代价地图（`/global_costmap`）、全局路径（`/global_path`）、机器人位姿（TF）、目标点（`/goal_pose` / plan markers）
+
+- `.gitignore` 忽略 `build/ install/ log/`；参数、控制器、平滑分小 commit 提交，见仓库历史
+
+## 7. 复现步骤
+
+```bash
+colcon build
+source install/setup.bash
+ros2 launch sp_nav_sim sim_robot.launch.py        # 终端1：仿真器
+ros2 launch sp_nav_bringup sp_nav.launch.py       # 终端2：导航全家桶
+# RViz 中用 2D Goal Pose 对 (14.1, 14.1) 点击一次即开始导航
+```
+
